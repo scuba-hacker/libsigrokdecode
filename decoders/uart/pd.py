@@ -118,7 +118,7 @@ class Decoder(srd.Decoder):
         {'id': 'bit_order', 'desc': 'Bit order', 'default': 'lsb-first',
             'values': ('lsb-first', 'msb-first')},
         {'id': 'format', 'desc': 'Data format', 'default': 'hex',
-            'values': ('ascii', 'dec', 'hex', 'oct', 'bin')},
+            'values': ('ascii', 'ascii_stream', 'dec', 'hex', 'oct', 'bin')},
         {'id': 'invert_rx', 'desc': 'Invert RX', 'default': 'no',
             'values': ('yes', 'no')},
         {'id': 'invert_tx', 'desc': 'Invert TX', 'default': 'no',
@@ -200,6 +200,22 @@ class Decoder(srd.Decoder):
         s, halfbit = self.startsample[rxtx], self.bit_width / 2.0
         self.put(s - floor(halfbit), self.samplenum + ceil(halfbit), self.out_binary, data)
 
+    def flush_ascii_stream(self, rxtx):
+        if self.options['format'] == 'ascii_stream' and len(self.ascii_stream_buffer[rxtx]) > 0:
+            self.putx(rxtx, [rxtx, [self.ascii_stream_buffer[rxtx]]])
+            self.ascii_stream_buffer[rxtx] = ''
+
+    def put_frame_error(self, rxtx, error_msg):
+        if self.options['format'] == 'ascii_stream':
+            # Flush any buffered characters before frame error
+            self.flush_ascii_stream(rxtx)
+            # Output frame error with blank lines
+            self.putx(rxtx, [rxtx, ['\n']])
+            self.putx(rxtx, [rxtx, [error_msg]])
+            self.putx(rxtx, [rxtx, ['\n']])
+        else:
+            self.putg([rxtx + Ann.RX_WARN, ['Frame error', 'Frame err', 'FE']])
+
     def __init__(self):
         self.reset()
 
@@ -220,6 +236,7 @@ class Decoder(srd.Decoder):
         self.packet_cache = [[], []]
         self.ss_packet, self.es_packet = [None, None], [None, None]
         self.idle_start = [None, None]
+        self.ascii_stream_buffer = ['', '']  # Buffer for RX and TX ASCII streams
 
     def start(self):
         self.out_python = self.register(srd.OUTPUT_PYTHON)
@@ -264,7 +281,7 @@ class Decoder(srd.Decoder):
         # for the next start bit (assuming this one was spurious).
         if self.startbit[rxtx] != 0:
             self.putp(['INVALID STARTBIT', rxtx, self.startbit[rxtx]])
-            self.putg([Ann.RX_WARN + rxtx, ['Frame error', 'Frame err', 'FE']])
+            self.put_frame_error(rxtx, 'Frame error: Invalid start bit')
             self.frame_valid[rxtx] = False
             es = self.samplenum + ceil(self.bit_width / 2.0)
             self.putpse(self.frame_start[rxtx], es, ['FRAME', rxtx,
@@ -281,7 +298,8 @@ class Decoder(srd.Decoder):
         self.databits[rxtx].clear()
 
         self.putp(['STARTBIT', rxtx, self.startbit[rxtx]])
-        self.putg([Ann.RX_START + rxtx, ['Start bit', 'Start', 'S']])
+        if self.options['format'] != 'ascii_stream':
+            self.putg([Ann.RX_START + rxtx, ['Start bit', 'Start', 'S']])
 
         self.advance_state(rxtx, signal)
 
@@ -302,9 +320,9 @@ class Decoder(srd.Decoder):
             s = ''
             for b in self.packet_cache[rxtx]:
                 s += self.format_value(b)
-                if self.options['format'] != 'ascii':
+                if self.options['format'] != 'ascii' and self.options['format'] != 'ascii_stream':
                     s += ' '
-            if self.options['format'] != 'ascii' and s[-1] == ' ':
+            if self.options['format'] != 'ascii' and self.options['format'] != 'ascii_stream' and s[-1] == ' ':
                 s = s[:-1] # Drop trailing space.
             self.putx_packet(rxtx, [Ann.RX_PACKET + rxtx, [s]])
             self.packet_cache[rxtx] = []
@@ -314,7 +332,8 @@ class Decoder(srd.Decoder):
         if self.startsample[rxtx] == -1:
             self.startsample[rxtx] = self.samplenum
 
-        self.putg([Ann.RX_DATA_BIT + rxtx, ['%d' % signal]])
+        if self.options['format'] != 'ascii_stream':
+            self.putg([Ann.RX_DATA_BIT + rxtx, ['%d' % signal]])
 
         # Store individual data bits and their start/end samplenumbers.
         s, halfbit = self.samplenum, int(self.bit_width / 2)
@@ -337,7 +356,11 @@ class Decoder(srd.Decoder):
         b = self.datavalue[rxtx]
         formatted = self.format_value(b)
         if formatted is not None:
-            self.putx(rxtx, [rxtx, [formatted]])
+            if self.options['format'] == 'ascii_stream':
+                # Buffer the character for stream output
+                self.ascii_stream_buffer[rxtx] += formatted
+            else:
+                self.putx(rxtx, [rxtx, [formatted]])
 
         bdata = b.to_bytes(self.bw, byteorder='big')
         self.putbin(rxtx, [Bin.RX + rxtx, bdata])
@@ -365,6 +388,13 @@ class Decoder(srd.Decoder):
                 return chr(v)
             hexfmt = "[{:02X}]" if bits <= 8 else "[{:03X}]"
             return hexfmt.format(v)
+        
+        # ASCII stream format: output printable characters as-is,
+        # non-printables as '?' for a clean stream output
+        if fmt == 'ascii_stream':
+            if v in range(32, 126 + 1):
+                return chr(v)
+            return '?'
 
         # Mere number to text conversion without prefix and padding
         # for the "decimal" output format.
@@ -398,11 +428,16 @@ class Decoder(srd.Decoder):
         if parity_ok(self.options['parity'], self.paritybit[rxtx],
                      self.datavalue[rxtx], self.options['data_bits']):
             self.putp(['PARITYBIT', rxtx, self.paritybit[rxtx]])
-            self.putg([Ann.RX_PARITY_OK + rxtx, ['Parity bit', 'Parity', 'P']])
+            if self.options['format'] != 'ascii_stream':
+                self.putg([Ann.RX_PARITY_OK + rxtx, ['Parity bit', 'Parity', 'P']])
         else:
             # TODO: Return expected/actual parity values.
             self.putp(['PARITY ERROR', rxtx, (0, 1)]) # FIXME: Dummy tuple...
-            self.putg([Ann.RX_PARITY_ERR + rxtx, ['Parity error', 'Parity err', 'PE']])
+            if self.options['format'] == 'ascii_stream':
+                self.flush_ascii_stream(rxtx)
+                self.putx(rxtx, [rxtx, ['\nParity error\n']])
+            else:
+                self.putg([Ann.RX_PARITY_ERR + rxtx, ['Parity error', 'Parity err', 'PE']])
             self.frame_valid[rxtx] = False
 
         self.advance_state(rxtx, signal)
@@ -414,11 +449,12 @@ class Decoder(srd.Decoder):
         # Stop bits must be 1. If not, we report an error.
         if signal != 1:
             self.putp(['INVALID STOPBIT', rxtx, signal])
-            self.putg([Ann.RX_WARN + rxtx, ['Frame error', 'Frame err', 'FE']])
+            self.put_frame_error(rxtx, 'Frame error: Invalid stop bit')
             self.frame_valid[rxtx] = False
 
         self.putp(['STOPBIT', rxtx, signal])
-        self.putg([Ann.RX_STOP + rxtx, ['Stop bit', 'Stop', 'T']])
+        if self.options['format'] != 'ascii_stream':
+            self.putg([Ann.RX_STOP + rxtx, ['Stop bit', 'Stop', 'T']])
 
         # Postprocess the UART frame after all STOP bits were seen.
         if len(self.stopbits[rxtx]) < self.options['stop_bits']:
@@ -481,6 +517,13 @@ class Decoder(srd.Decoder):
         self.state[rxtx] = 'WAIT FOR START BIT'
 
     def handle_frame(self, rxtx, ss, es):
+        # For ascii_stream format, flush buffer on line endings or every 80 chars
+        if (self.options['format'] == 'ascii_stream' and 
+            len(self.ascii_stream_buffer[rxtx]) > 0 and
+            (len(self.ascii_stream_buffer[rxtx]) >= 80 or 
+             self.ascii_stream_buffer[rxtx][-1] in '\r\n')):
+            self.flush_ascii_stream(rxtx)
+            
         # Pass the complete UART frame to upper layers.
         self.putpse(ss, es, ['FRAME', rxtx,
             (self.datavalue[rxtx], self.frame_valid[rxtx])])
